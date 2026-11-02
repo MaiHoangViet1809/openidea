@@ -72,6 +72,34 @@ describe("mermaid in the markdown preview", () => {
     expect(document.body.querySelector(":scope > [id^='d']")).toBeNull();
   });
 
+  it("renders a math diagram with the installed Mermaid and strict security", async () => {
+    const { default: mermaid } = await vi.importActual<typeof import("mermaid")>("mermaid");
+    const svgPrototype = SVGElement.prototype as SVGElement & { getBBox?: () => DOMRect };
+    const previousGetBBox = svgPrototype.getBBox;
+    const previousMathMLElement = window.MathMLElement;
+    // jsdom omits MathMLElement; provide feature detection so the real KaTeX path runs.
+    window.MathMLElement = class {} as typeof window.MathMLElement;
+    svgPrototype.getBBox = () => ({ x: 0, y: 0, width: 100, height: 40 }) as DOMRect;
+    mermaid.initialize({ startOnLoad: false, securityLevel: "strict" });
+    const id = "openidea-real-math-security-check";
+    try {
+      const { svg } = await mermaid.render(
+        id,
+        String.raw`flowchart LR
+      A["$$x^2$$"] -->|"$$\sqrt{x+3}$$"| B("$$\frac{1}{2}$$")`,
+      );
+      expect(svg).toContain("<svg");
+      expect(svg).toContain("<math");
+    } finally {
+      if (previousGetBBox) svgPrototype.getBBox = previousGetBBox;
+      else delete svgPrototype.getBBox;
+      if (previousMathMLElement) window.MathMLElement = previousMathMLElement;
+      else delete (window as Window & { MathMLElement?: typeof window.MathMLElement }).MathMLElement;
+      document.getElementById(`d${id}`)?.remove();
+      document.getElementById(`i${id}`)?.remove();
+    }
+  });
+
   it("shows syntax errors inline next to the source without throwing", async () => {
     const root = preview("```mermaid\nsequenceDiagram\nbad\n```\n");
     await expect(renderMermaidIn(root).done).resolves.toBeUndefined();

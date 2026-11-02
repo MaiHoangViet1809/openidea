@@ -58,6 +58,7 @@ async fn application_commands_work_in_restricted_projects_and_without_a_project(
         "vcs_write_patch",
         "remote_bootstrap_list",
         "deploy_test_connection",
+        "web_url",
     ] {
         assert!(ide_host::trust::restricted_command_allowed(command), "{command}");
         for window in ["main", "welcome"] {

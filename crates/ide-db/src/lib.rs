@@ -425,11 +425,9 @@ impl DbManager {
                 Ok(())
             }
         };
-        if let Err(e) = result {
-            // The session copy still works; the user is asked again next time.
-            tracing::warn!("could not save the password: {}", e.message);
-        }
-        Ok(())
+        // The session copy remains usable, but report that persistence failed so
+        // the caller knows the credential will need to be entered next time.
+        result
     }
 
     async fn secret(&self, key: String, saved: bool) -> Option<String> {

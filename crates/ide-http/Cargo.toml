@@ -17,6 +17,9 @@ reqwest.workspace = true
 rustls.workspace = true
 rustls-platform-verifier.workspace = true
 uuid.workspace = true
+blake3.workspace = true
+keyring.workspace = true
+aes-gcm.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net"] }

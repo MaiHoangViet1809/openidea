@@ -14,6 +14,8 @@ tokio.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 dirs.workspace = true
+blake3.workspace = true
+keyring.workspace = true
 russh = { version = "0.64", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-config = "0.58.0"
 russh-sftp = "2.4"

@@ -20,6 +20,8 @@ tiberius.workspace = true
 bb8.workspace = true
 tokio-util = { workspace = true, features = ["compat"] }
 dirs.workspace = true
+blake3.workspace = true
+keyring.workspace = true
 ide-ssh.workspace = true
 
 [dev-dependencies]

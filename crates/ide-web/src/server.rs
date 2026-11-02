@@ -61,13 +61,24 @@ impl WebServer {
     /// The URL serving `file`: under `root` (the project) when it contains the
     /// file, else under the file's directory. Starts the server if needed.
     pub async fn url_for(&self, root: Option<&Path>, file: &Path) -> IdeResult<String> {
-        let base = match root {
-            Some(r) if file.starts_with(r) && file != r => r,
-            _ => file.parent().ok_or_else(|| IdeError::invalid(format!("no directory: {}", file.display())))?,
+        let (base, rel) = match root {
+            Some(root) if file.starts_with(root) && file != root => {
+                (tokio::fs::canonicalize(root).await?, file.strip_prefix(root).expect("prefix checked"))
+            }
+            _ => {
+                let parent =
+                    file.parent().ok_or_else(|| IdeError::invalid(format!("no directory: {}", file.display())))?;
+                (
+                    tokio::fs::canonicalize(parent).await?,
+                    file.strip_prefix(parent).map_err(|e| IdeError::internal(e.to_string()))?,
+                )
+            }
         };
-        let rel = file.strip_prefix(base).map_err(|e| IdeError::internal(e.to_string()))?;
+        if private_path(&base) || private_path(rel) {
+            return Err(IdeError::not_found("preview path is not available"));
+        }
         let port = self.port().await?;
-        let key = self.register(base);
+        let key = self.register(&base);
         let mut url = format!("http://127.0.0.1:{port}/{}/{}", self.shared.token, enc(&key));
         for c in rel.components() {
             url.push('/');
@@ -173,7 +184,7 @@ async fn read_head(sock: &mut TcpStream) -> std::io::Result<Option<Request>> {
 }
 
 enum Response {
-    File { path: PathBuf, len: u64 },
+    File { file: tokio::fs::File, path: PathBuf, len: u64 },
     Redirect(String),
     Error(u16, &'static str),
 }
@@ -191,7 +202,7 @@ async fn serve(mut sock: TcpStream, shared: &Shared, port: u16) -> std::io::Resu
     };
     let mut out = String::new();
     match &response {
-        Response::File { path, len } => {
+        Response::File { path, len, .. } => {
             out.push_str("HTTP/1.1 200 OK\r\n");
             out.push_str(&format!("Content-Type: {}\r\nContent-Length: {len}\r\n", content_type(path)));
         }
@@ -209,8 +220,7 @@ async fn serve(mut sock: TcpStream, shared: &Shared, port: u16) -> std::io::Resu
     sock.write_all(out.as_bytes()).await?;
     if !head_only {
         match response {
-            Response::File { path, .. } => {
-                let mut file = tokio::fs::File::open(&path).await?;
+            Response::File { mut file, .. } => {
                 tokio::io::copy(&mut file, &mut sock).await?;
             }
             Response::Error(_, reason) => sock.write_all(reason.as_bytes()).await?,
@@ -233,7 +243,9 @@ async fn resolve(shared: &Shared, target: &str) -> Response {
         return NOT_FOUND;
     }
     let Some(key) = segments.next().and_then(dec) else { return NOT_FOUND };
-    let Some(mut file) = shared.roots.read().get(&key).cloned() else { return NOT_FOUND };
+    let Some(root) = shared.roots.read().get(&key).cloned() else { return NOT_FOUND };
+    let mut file = root.clone();
+    let mut rel = PathBuf::new();
     let mut trailing_slash = true;
     for seg in segments {
         trailing_slash = seg.is_empty();
@@ -241,9 +253,20 @@ async fn resolve(shared: &Shared, target: &str) -> Response {
             continue;
         }
         match dec(seg) {
-            Some(s) if s != "." && s != ".." && !s.contains(['/', '\\', ':', '\0']) => file.push(s),
+            Some(s) if s != "." && s != ".." && !s.contains(['/', '\\', ':', '\0']) => {
+                rel.push(&s);
+                file.push(s);
+            }
             _ => return NOT_FOUND,
         }
+    }
+    if private_path(&rel) {
+        return NOT_FOUND;
+    }
+    let Ok(mut file) = tokio::fs::canonicalize(&file).await else { return NOT_FOUND };
+    let Ok(rel) = file.strip_prefix(&root) else { return NOT_FOUND };
+    if private_path(rel) {
+        return NOT_FOUND;
     }
     let Ok(meta) = tokio::fs::metadata(&file).await else { return NOT_FOUND };
     if meta.is_dir() {
@@ -252,12 +275,69 @@ async fn resolve(shared: &Shared, target: &str) -> Response {
             return Response::Redirect(format!("{path}/"));
         }
         file.push("index.html");
-        return match tokio::fs::metadata(&file).await {
-            Ok(m) if m.is_file() => Response::File { path: file, len: m.len() },
-            _ => NOT_FOUND,
-        };
+        let Ok(index) = tokio::fs::canonicalize(&file).await else { return NOT_FOUND };
+        let Ok(rel) = index.strip_prefix(&root) else { return NOT_FOUND };
+        if private_path(rel) {
+            return NOT_FOUND;
+        }
+        return open_verified(&root, &index).await.unwrap_or(NOT_FOUND);
     }
-    Response::File { path: file, len: meta.len() }
+    if meta.is_file() { open_verified(&root, &file).await.unwrap_or(NOT_FOUND) } else { NOT_FOUND }
+}
+
+/// Open first, then verify the name still identifies the opened file. The
+/// retained handle prevents a later path swap from changing the served file.
+async fn open_verified(root: &Path, path: &Path) -> Option<Response> {
+    let file = tokio::fs::File::open(path).await.ok()?;
+    let opened = file.metadata().await.ok()?;
+    if !opened.is_file() {
+        return None;
+    }
+    let canonical = tokio::fs::canonicalize(path).await.ok()?;
+    let relative = canonical.strip_prefix(root).ok()?;
+    if private_path(relative) {
+        return None;
+    }
+    let named = tokio::fs::metadata(&canonical).await.ok()?;
+    if !same_file(&opened, &named) {
+        return None;
+    }
+    Some(Response::File { file, path: canonical, len: opened.len() })
+}
+
+#[cfg(unix)]
+fn same_file(opened: &std::fs::Metadata, named: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    opened.dev() == named.dev() && opened.ino() == named.ino()
+}
+
+#[cfg(windows)]
+fn same_file(opened: &std::fs::Metadata, named: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    matches!(
+        (
+            opened.volume_serial_number(),
+            opened.file_index(),
+            named.volume_serial_number(),
+            named.file_index()
+        ),
+        (Some(opened_volume), Some(opened_index), Some(named_volume), Some(named_index))
+            if opened_volume == named_volume && opened_index == named_index
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(_opened: &std::fs::Metadata, _named: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn private_path(path: &Path) -> bool {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
+            _ => None,
+        })
+        .any(|name| name.starts_with(".env") || matches!(name.as_str(), ".git" | ".ssh" | ".aws" | ".netrc" | ".npmrc"))
 }
 
 fn dec(s: &str) -> Option<String> {
@@ -351,5 +431,74 @@ mod tests {
         let ub = server.url_for(Some(&a), &b.join("p.html")).await.unwrap();
         assert!(ua.ends_with("/site/p.html") && ub.ends_with("/site-2/p.html"), "{ua} {ub}");
         assert_eq!(server.url_for(None, &a.join("q.html")).await.unwrap(), ua.replace("p.html", "q.html"));
+    }
+
+    #[tokio::test]
+    async fn lightedit_does_not_serve_private_directory_as_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let private = tmp.path().join("project/.git");
+        std::fs::create_dir_all(&private).unwrap();
+        let config = private.join("config");
+        std::fs::write(&config, "private").unwrap();
+        let server = WebServer::new();
+
+        assert!(server.url_for(None, &config).await.is_err());
+        assert!(server.port.get().is_none(), "reject before starting the preview server");
+    }
+
+    #[tokio::test]
+    async fn refuses_known_secret_metadata_but_serves_ordinary_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join("web/.git")).unwrap();
+        std::fs::create_dir_all(root.join("web/.ssh")).unwrap();
+        std::fs::create_dir_all(root.join("web/.aws")).unwrap();
+        std::fs::create_dir_all(root.join("web/.well-known")).unwrap();
+        std::fs::write(root.join("web/index.html"), "ok").unwrap();
+        std::fs::write(root.join("web/.env.local"), "secret").unwrap();
+        std::fs::write(root.join("web/.git/config"), "secret").unwrap();
+        std::fs::write(root.join("web/.ssh/id_ed25519"), "secret").unwrap();
+        std::fs::write(root.join("web/.aws/credentials"), "secret").unwrap();
+        std::fs::write(root.join("web/.netrc"), "secret").unwrap();
+        std::fs::write(root.join("web/.npmrc"), "secret").unwrap();
+        std::fs::write(root.join("web/.well-known/security.txt"), "contact").unwrap();
+
+        let server = WebServer::new();
+        let url = server.url_for(Some(&root), &root.join("web/index.html")).await.unwrap();
+        let base = url.trim_end_matches("/web/index.html");
+        assert!(get(&url, None).await.ends_with("ok"));
+        assert!(get(&format!("{base}/web/.well-known/security.txt"), None).await.ends_with("contact"));
+        for path in [
+            "/web/.env.local",
+            "/web/.git/config",
+            "/web/.ssh/id_ed25519",
+            "/web/.aws/credentials",
+            "/web/.netrc",
+            "/web/.npmrc",
+        ] {
+            assert!(get(&format!("{base}{path}"), None).await.starts_with("HTTP/1.1 404"), "{path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_file_and_directory_symlinks_outside_project_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(root.join("web")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("web/index.html"), "ok").unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        symlink(outside.join("secret.txt"), root.join("web/secret-link.txt")).unwrap();
+        symlink(&outside, root.join("web/outside-link")).unwrap();
+
+        let server = WebServer::new();
+        let url = server.url_for(Some(&root), &root.join("web/index.html")).await.unwrap();
+        let base = url.trim_end_matches("/web/index.html");
+        assert!(get(&format!("{base}/web/secret-link.txt"), None).await.starts_with("HTTP/1.1 404"));
+        assert!(get(&format!("{base}/web/outside-link/secret.txt"), None).await.starts_with("HTTP/1.1 404"));
     }
 }

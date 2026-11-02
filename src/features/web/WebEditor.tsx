@@ -56,6 +56,7 @@ function WebPreview({ path }: { path: string }) {
   const [error, setError] = useState<string | null>(null);
   const [seq, setSeq] = useState(0);
   const root = useProject((s) => s.project?.root ?? null);
+  const trusted = useProject((s) => s.project?.trusted === true);
 
   useEffect(() => {
     let live = true;
@@ -97,7 +98,7 @@ function WebPreview({ path }: { path: string }) {
       className={styles.preview}
       title={tx("HTML preview")}
       src={url}
-      sandbox="allow-scripts allow-same-origin allow-forms allow-modals allow-popups"
+      sandbox={trusted ? "allow-scripts allow-same-origin allow-forms allow-modals allow-popups" : "allow-scripts"}
     />
   );
 }

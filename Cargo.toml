@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "src-tauri"]
+exclude = ["vendor/tauri-plugin-mcp-bridge"]
 
 [workspace.package]
 version = "0.1.33"
@@ -74,6 +75,8 @@ notify = "8"
 notify-debouncer-full = "0.6"
 trash = "5"
 blake3 = "1"
+aes-gcm = "0.11.1"
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
 dunce = "1"
 dirs = "6"
 zip = { version = "9", default-features = false, features = ["deflate"] }
@@ -120,3 +123,6 @@ opt-level = 3
 panic = "unwind"
 # Keep the symbol table: crash reports and logged backtraces name functions.
 strip = "debuginfo"
+
+[patch.crates-io]
+tauri-plugin-mcp-bridge = { path = "vendor/tauri-plugin-mcp-bridge" }
