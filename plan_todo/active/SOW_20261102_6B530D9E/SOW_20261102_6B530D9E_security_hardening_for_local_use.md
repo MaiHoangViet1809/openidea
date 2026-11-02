@@ -123,12 +123,12 @@ Mermaid preview              -> dependency set with patched KaTeX
 
 ## Verification / Closeout
 
-- Definitely implemented: Approved preview, debug MCP Origin guard, OS credential-store and JSON migration, encrypted HTTP history, and Mermaid/KaTeX dependency changes. Targeted tests pass; the macOS debug MCP native-client and Origin checks pass; a release `.app` bundle launched without a listener on ports 9223–9322. The proxy integration test used macOS Keychain.
+- Definitely implemented: Approved preview, debug MCP Origin guard, OS credential-store and JSON migration, encrypted HTTP history, and Mermaid/KaTeX dependency changes, committed as `c808fee`. Targeted tests pass; the macOS debug MCP native-client and Origin checks pass; a release `.app` bundle launched without a listener on ports 9223–9322. The proxy integration test used macOS Keychain.
 - Approximated / simulated: Unit tests use an in-memory credential-store backend for deterministic migration/failure checks. Windows and Linux credential-store builds were attempted but could not run because this Mac lacks the Windows SDK headers and `x86_64-linux-gnu-gcc`.
 - Not implemented / not verified: A manually typed `proxy.password` in global or project TOML can still be used as a fallback; the proposed fix is in DRAFT extension `SOW_20261102_6B530D9E_EXT_R7X4M9Q2`. Cross-platform runtime coverage is not available here. The `.app` bundle built and launched, while updater archive signing stopped because no private signing key is configured; release signing is out of scope.
 
 ## Progress
-- progress_updated_dttm: 2026-11-02T14:36:59+07:00
+- progress_updated_dttm: 2026-11-02T14:38:44+07:00
 
 | Item | Status | Evidence / Pending reason | Next action / Owner |
 | --- | --- | --- | --- |
@@ -138,4 +138,4 @@ Mermaid preview              -> dependency set with patched KaTeX
 | C3: OS credential storage and legacy migration | COMPLETE (base scope) | SSH/Git: 21 tests; DB: 40 unit and 13 integration tests; HTTP proxy integration: 1 test using macOS Keychain. JSON/temp migration, failure retention, and no plaintext JSON write are covered. Manual TOML fallback is tracked separately in the unapproved DRAFT extension. | Obtain separate approval before editing the newly identified proxy owner file. |
 | C4: Encrypted HTTP history and migration | COMPLETE | `ide-http`: 23 tests pass, including round-trip, tamper, migration retention, and unavailable-store behavior. | Main records evidence and commit. |
 | C5: Patched KaTeX dependency resolution | COMPLETE | Production audit reports no known vulnerabilities; strict Mermaid math and WebEditor tests pass; `pnpm build` passes. | Main records evidence and commit. |
-| C6: Runtime verification, gap review, and scoped commit | IN_PROGRESS | Rustfmt and changed-file frontend lint/format pass; targeted Clippy passes. Full workspace Clippy reports pre-existing findings in untouched `ide-syntax` and `ide-lsp`; full frontend lint reports unused catch variables in untouched upstream vendor JS; full format check flags AGENTS/SOW and untouched vendor files. Release `.app` built/launched; updater signing lacks a private key. | Fetch and compare upstream, stage only approved implementation plus SOW bundle, inspect staged paths, and commit. |
+| C6: Runtime verification, gap review, and scoped commit | COMPLETE (base scope) | Commit `c808fee` contains the approved implementation and SOW bundle. Rustfmt and changed-file frontend lint/format pass; targeted Clippy passes. Full workspace Clippy reports findings in untouched `ide-syntax` and `ide-lsp`; full frontend lint reports unused catch variables in untouched upstream vendor JS; full format check flags AGENTS/SOW and untouched vendor files. Release `.app` built/launched; updater signing lacks a private key. | Await explicit approval for DRAFT extension `SOW_20261102_6B530D9E_EXT_R7X4M9Q2` before widening scope. |
