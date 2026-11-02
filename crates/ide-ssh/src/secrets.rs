@@ -22,22 +22,24 @@ impl SecretFile {
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
-        let _g = LOCK.lock();
-        if let Err(error) = self.migrate_legacy() {
-            tracing::warn!("could not migrate saved credentials: {}", error.message);
-            return None;
-        }
-        match self.entry(key).and_then(|entry| match entry.get_secret() {
-            Ok(value) => String::from_utf8(value).map(Some).map_err(|error| store_error("decode credential", error)),
-            Err(KeyringError::NoEntry) => Ok(None),
-            Err(error) => Err(store_error("read credential", error)),
-        }) {
+        match self.try_get(key) {
             Ok(value) => value,
             Err(error) => {
                 tracing::warn!("could not read saved credential: {}", error.message);
                 None
             }
         }
+    }
+
+    /// Reads a credential while preserving the distinction between a missing item and a store error.
+    pub fn try_get(&self, key: &str) -> IdeResult<Option<String>> {
+        let _g = LOCK.lock();
+        self.migrate_legacy()?;
+        self.entry(key).and_then(|entry| match entry.get_secret() {
+            Ok(value) => String::from_utf8(value).map(Some).map_err(|error| store_error("decode credential", error)),
+            Err(KeyringError::NoEntry) => Ok(None),
+            Err(error) => Err(store_error("read credential", error)),
+        })
     }
 
     pub fn set(&self, key: &str, secret: &str) -> IdeResult<()> {
@@ -66,13 +68,70 @@ impl SecretFile {
         Ok(())
     }
 
-    pub fn delete(&self, key: &str) {
+    /// Stores a credential only when the OS store confirms that no item exists.
+    /// Returns `true` when this call inserted it and `false` when an existing value won.
+    pub fn set_if_absent(&self, key: &str, secret: &str) -> IdeResult<bool> {
         let _g = LOCK.lock();
-        if let Err(error) = self.migrate_legacy() {
-            tracing::warn!("could not migrate saved credentials before deletion: {}", error.message);
-            return;
+        self.migrate_legacy()?;
+        let mut keys = self.read_keys()?;
+        let original_keys = keys.clone();
+        let entry = self.entry(key)?;
+        match entry.get_secret() {
+            Ok(_) => {
+                if keys.insert(key.to_owned()) {
+                    self.write_keys(&keys)?;
+                }
+                Ok(false)
+            }
+            Err(KeyringError::NoEntry) => {
+                entry.set_secret(secret.as_bytes()).map_err(|error| store_error("save credential", error))?;
+                let stored = match entry.get_secret() {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        if let Err(rollback_error) = entry.delete_credential() {
+                            tracing::error!("credential verification failed and cleanup failed: {rollback_error}");
+                        }
+                        return Err(store_error("verify saved credential", error));
+                    }
+                };
+                if stored != secret.as_bytes() {
+                    if let Err(error) = entry.delete_credential() {
+                        tracing::error!("credential verification mismatch and cleanup failed: {error}");
+                    }
+                    return Err(IdeError::unavailable("saved credential verification failed"));
+                }
+                keys.insert(key.to_owned());
+                if let Err(error) = self.write_keys(&keys) {
+                    if let Err(rollback_error) = self.write_keys(&original_keys) {
+                        tracing::error!(
+                            "credential index update failed and index rollback failed: {}",
+                            rollback_error.message
+                        );
+                    }
+                    if let Err(rollback_error) = entry.delete_credential() {
+                        tracing::error!(
+                            "credential index update failed and credential rollback failed: {rollback_error}"
+                        );
+                    }
+                    return Err(error);
+                }
+                Ok(true)
+            }
+            Err(error) => Err(store_error("read credential before migration", error)),
         }
-        let result = self.entry(key).and_then(|entry| {
+    }
+
+    pub fn delete(&self, key: &str) {
+        if let Err(error) = self.delete_checked(key) {
+            tracing::warn!("could not delete saved credential: {}", error.message);
+        }
+    }
+
+    /// Deletes a credential and reports OS credential-store failures to the caller.
+    pub fn delete_checked(&self, key: &str) -> IdeResult<()> {
+        let _g = LOCK.lock();
+        self.migrate_legacy()?;
+        self.entry(key).and_then(|entry| {
             let previous = match entry.get_secret() {
                 Ok(value) => Some(value),
                 Err(KeyringError::NoEntry) => None,
@@ -93,10 +152,7 @@ impl SecretFile {
                 return Err(error);
             }
             Ok(())
-        });
-        if let Err(error) = result {
-            tracing::warn!("could not delete saved credential: {}", error.message);
-        }
+        })
     }
 
     /// Sorted keys stored for Settings › Git credential management.
@@ -206,12 +262,13 @@ mod test_credential_store {
     use keyring::Error;
     use keyring::credential::{Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence};
     use std::any::Any;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     static VALUES: OnceLock<Mutex<HashMap<String, Vec<u8>>>> = OnceLock::new();
     static FAIL_NEXT_SET: AtomicBool = AtomicBool::new(false);
+    static FAIL_GET_FOR: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
     #[derive(Debug)]
     struct MemoryBuilder;
@@ -229,6 +286,9 @@ mod test_credential_store {
         }
 
         fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+            if FAIL_GET_FOR.get_or_init(Default::default).lock().unwrap().remove(&self.0) {
+                return Err(Error::NoStorageAccess(Box::new(std::io::Error::other("injected store failure"))));
+            }
             VALUES.get_or_init(Default::default).lock().unwrap().get(&self.0).cloned().ok_or(Error::NoEntry)
         }
 
@@ -261,6 +321,10 @@ mod test_credential_store {
 
     pub(super) fn fail_next_set() {
         FAIL_NEXT_SET.store(true, Ordering::SeqCst);
+    }
+
+    pub(super) fn fail_get_for(account: String) {
+        FAIL_GET_FOR.get_or_init(Default::default).lock().unwrap().insert(account);
     }
 }
 
@@ -328,6 +392,21 @@ mod tests {
         proxy.set("same-key", "proxy-secret").unwrap();
         assert_eq!(ssh.get("same-key").as_deref(), Some("ssh-secret"));
         assert_eq!(proxy.get("same-key").as_deref(), Some("proxy-secret"));
+    }
+
+    #[test]
+    fn distinguishes_missing_from_unavailable_and_does_not_overwrite_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = SecretFile::new(tmp.path().join("proxy-password.json"));
+
+        assert!(file.try_get("proxy").unwrap().is_none());
+        assert!(file.set_if_absent("proxy", "first-secret").unwrap());
+        assert!(!file.set_if_absent("proxy", "stale-secret").unwrap());
+        assert_eq!(file.try_get("proxy").unwrap().as_deref(), Some("first-secret"));
+
+        let account = format!("{SERVICE}\0{}", account(&file.path.to_string_lossy(), "credential", "proxy"));
+        test_credential_store::fail_get_for(account);
+        assert!(file.try_get("proxy").is_err(), "store failure is not treated as a missing item");
     }
 
     #[test]

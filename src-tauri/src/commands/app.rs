@@ -201,7 +201,7 @@ pub struct SettingsImport {
 #[tauri::command]
 #[specta::specta]
 pub async fn settings_import(window: Window, state: State<'_, AppState>, path: PathBuf) -> IdeResult<SettingsImport> {
-    let (_, storage) = state.global_settings.import_bundle(&path)?;
+    let (_, storage) = state.host.import_settings_bundle(&path)?;
     for project in state.projects() {
         let effective = project.settings.reload();
         project

@@ -124,6 +124,9 @@ impl Host {
             requests: Default::default(),
             project_requests: RwLock::default(),
         };
+        if let Err(error) = host.migrate_global_proxy_password() {
+            tracing::warn!("could not migrate HTTP proxy password from settings.toml: {}", error.message);
+        }
         host.apply_proxy();
         host
     }

@@ -157,6 +157,26 @@ fn set_in_document(doc: &mut DocumentMut, segments: &[&str], value: Option<toml_
     }
 }
 
+fn sanitized_settings(settings: &str) -> IdeResult<(String, Option<String>)> {
+    let mut doc: DocumentMut =
+        settings.parse().map_err(|e| IdeError::invalid(format!("invalid settings TOML: {e}")))?;
+    let password_item =
+        doc.as_table().get("proxy").and_then(Item::as_table_like).and_then(|proxy| proxy.get("password"));
+    let proxy_password = password_item.and_then(Item::as_value).and_then(toml_edit::Value::as_str).map(str::to_owned);
+    if password_item.is_some()
+        && let Some(proxy) = doc.as_table_mut().get_mut("proxy").and_then(Item::as_table_like_mut)
+    {
+        proxy.remove("password");
+    }
+    let sanitized = doc.to_string();
+    Ok((sanitized, proxy_password))
+}
+
+fn validate_settings_layer(settings: &str, context: &str) -> IdeResult<()> {
+    let layer = parse_layer(settings).map_err(|e| IdeError::invalid(format!("{context} TOML: {e}")))?;
+    try_merge(&mut defaults_json(), layer).map_err(|e| IdeError::invalid(format!("{context}: {e}")))
+}
+
 impl SettingsStore {
     pub fn load(config_dir: &Path, project_root: Option<&Path>) -> Self {
         let store = Self {
@@ -284,34 +304,46 @@ impl SettingsStore {
 
     /// File › Manage IDE Settings › Export Settings…: the global layer plus
     /// frontend-held IDE state (`storage`: keymaps' companions such as live
-    /// templates, macros) as one JSON file.
+    /// templates, macros) as one JSON file. Proxy credentials are omitted.
     pub fn export_bundle(&self, path: &Path, storage: BTreeMap<String, String>) -> IdeResult<()> {
-        let settings = match std::fs::read_to_string(&self.global_file) {
+        let raw_settings = match std::fs::read_to_string(&self.global_file) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e.into()),
         };
-        let bundle = SettingsBundle { format: BUNDLE_FORMAT.into(), version: BUNDLE_VERSION, settings, storage };
+        let (settings, _) = sanitized_settings(&raw_settings)?;
+        let bundle = SettingsBundleFile { format: BUNDLE_FORMAT.into(), version: BUNDLE_VERSION, settings, storage };
         let json = serde_json::to_vec_pretty(&bundle).map_err(|e| IdeError::internal(e.to_string()))?;
         ide_vfs::write_atomic(path, &json)?;
         Ok(())
     }
 
-    /// Import Settings…: replaces the global layer with the bundle's (validated
-    /// first) and returns the new effective settings and the bundle's `storage`.
-    pub fn import_bundle(&self, path: &Path) -> IdeResult<(Settings, BTreeMap<String, String>)> {
+    /// Parses and validates a bundle, separating its proxy password from the settings to be persisted.
+    pub fn prepare_bundle_import(path: &Path) -> IdeResult<SettingsBundleImport> {
         let bytes = std::fs::read(path)?;
-        let bundle: SettingsBundle = serde_json::from_slice(&bytes)
+        let bundle: SettingsBundleFile = serde_json::from_slice(&bytes)
             .map_err(|e| IdeError::invalid(format!("not an OpenIDEA settings file: {e}")))?;
         if bundle.format != BUNDLE_FORMAT || bundle.version > BUNDLE_VERSION {
             return Err(IdeError::invalid("not an OpenIDEA settings file, or one from a newer version"));
         }
-        let layer = parse_layer(&bundle.settings).map_err(|e| IdeError::invalid(format!("invalid settings: {e}")))?;
-        try_merge(&mut defaults_json(), layer).map_err(|e| IdeError::invalid(format!("invalid settings: {e}")))?;
+        validate_settings_layer(&bundle.settings, "invalid settings")?;
+        let (settings, proxy_password) = sanitized_settings(&bundle.settings)?;
+        validate_settings_layer(&settings, "invalid sanitized settings")?;
+        Ok(SettingsBundleImport { settings, storage: bundle.storage, proxy_password })
+    }
+
+    /// Replaces the global layer with a prepared, sanitized bundle.
+    pub fn commit_bundle_import(
+        &self,
+        bundle: SettingsBundleImport,
+    ) -> IdeResult<(Settings, BTreeMap<String, String>)> {
+        if bundle.proxy_password.is_some() {
+            return Err(IdeError::invalid("proxy password must be handled before settings import"));
+        }
         if let Some(dir) = self.global_file.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        ide_vfs::write_atomic(&self.global_file, bundle.settings.as_bytes())?;
+        ide_vfs::write_atomic_strict(&self.global_file, bundle.settings.as_bytes())?;
         Ok((self.reload(), bundle.storage))
     }
 }
@@ -320,13 +352,25 @@ const BUNDLE_FORMAT: &str = "openidea-settings";
 const BUNDLE_VERSION: u32 = 1;
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct SettingsBundle {
+struct SettingsBundleFile {
     format: String,
     version: u32,
-    /// The global `settings.toml`, verbatim (comments included).
+    /// The global settings TOML (comments included; proxy password is filtered).
     settings: String,
     #[serde(default)]
     storage: BTreeMap<String, String>,
+}
+
+pub struct SettingsBundleImport {
+    settings: String,
+    storage: BTreeMap<String, String>,
+    proxy_password: Option<String>,
+}
+
+impl SettingsBundleImport {
+    pub fn take_proxy_password(&mut self) -> Option<String> {
+        self.proxy_password.take()
+    }
 }
 
 #[cfg(test)]
@@ -527,7 +571,9 @@ mod tests {
         source.export_bundle(&file, storage.clone()).unwrap();
 
         let target = SettingsStore::load(&b, None);
-        let (settings, imported) = target.import_bundle(&file).unwrap();
+        let mut bundle = SettingsStore::prepare_bundle_import(&file).unwrap();
+        assert_eq!(bundle.take_proxy_password(), None);
+        let (settings, imported) = target.commit_bundle_import(bundle).unwrap();
         assert_eq!(settings.editor.font_size, 17.0);
         assert!(settings.general.power_save_mode);
         assert_eq!(imported, storage);
@@ -536,10 +582,66 @@ mod tests {
         let bad = tmp.path().join("bad.json");
         std::fs::write(&bad, r#"{"format":"openidea-settings","version":1,"settings":"[editor]\nfontSize = \"x\"\n"}"#)
             .unwrap();
-        assert!(target.import_bundle(&bad).is_err());
+        assert!(SettingsStore::prepare_bundle_import(&bad).is_err());
         std::fs::write(&bad, r#"{"format":"other","version":1,"settings":""}"#).unwrap();
-        assert!(target.import_bundle(&bad).is_err());
+        assert!(SettingsStore::prepare_bundle_import(&bad).is_err());
         assert_eq!(target.effective().editor.font_size, 17.0);
+    }
+
+    #[test]
+    fn settings_bundles_strip_proxy_passwords_and_preserve_them_only_for_import_handling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = SettingsStore::load(&tmp.path().join("source"), None);
+        let source_file = source.file(SettingsScope::Global).unwrap();
+        std::fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        let legacy = "[proxy]\nmode = \"manual\"\npassword = \"legacy-secret\"\n";
+        std::fs::write(source_file, legacy).unwrap();
+
+        let exported = tmp.path().join("export.json");
+        source.export_bundle(&exported, BTreeMap::new()).unwrap();
+        let exported_text = std::fs::read_to_string(&exported).unwrap();
+        assert!(!exported_text.contains("legacy-secret"));
+        assert!(!exported_text.contains("password"));
+        assert_eq!(std::fs::read_to_string(source_file).unwrap(), legacy);
+
+        let old_bundle = tmp.path().join("old.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "format": BUNDLE_FORMAT,
+            "version": BUNDLE_VERSION,
+            "settings": legacy,
+            "storage": {}
+        }))
+        .unwrap();
+        std::fs::write(&old_bundle, bytes).unwrap();
+        let mut prepared = SettingsStore::prepare_bundle_import(&old_bundle).unwrap();
+        assert_eq!(prepared.take_proxy_password().as_deref(), Some("legacy-secret"));
+        let target = SettingsStore::load(&tmp.path().join("target"), None);
+        let (settings, _) = target.commit_bundle_import(prepared).unwrap();
+        let persisted = std::fs::read_to_string(target.file(SettingsScope::Global).unwrap()).unwrap();
+        assert!(!persisted.contains("legacy-secret"));
+        assert!(!persisted.contains("password"));
+        assert_eq!(settings.proxy.password, "");
+    }
+
+    #[test]
+    fn settings_export_preserves_existing_values_it_does_not_interpret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = SettingsStore::load(&tmp.path().join("source"), None);
+        let source_file = source.file(SettingsScope::Global).unwrap();
+        std::fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            source_file,
+            "[editor]\nfontSize = \"legacy-invalid-value\"\n[proxy]\npassword = [\"legacy-secret\"]\n",
+        )
+        .unwrap();
+
+        let exported = tmp.path().join("export.json");
+        source.export_bundle(&exported, BTreeMap::new()).unwrap();
+        let exported_text = std::fs::read_to_string(exported).unwrap();
+
+        assert!(exported_text.contains("fontSize = \\\"legacy-invalid-value\\\""));
+        assert!(!exported_text.contains("legacy-secret"));
+        assert!(!exported_text.contains("password"));
     }
 
     #[test]
